@@ -1,4 +1,7 @@
-require('dotenv').config({ quiet: true });
+const dotenv = require('dotenv');
+
+dotenv.config({ path: '.env', quiet: true });
+dotenv.config({ path: 'env.txt', quiet: true });
 
 const fs = require('fs');
 const prism = require('prism-media');
