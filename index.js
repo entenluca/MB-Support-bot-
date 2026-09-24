@@ -1,7 +1,7 @@
 require('dotenv').config({ quiet: true });
 
 const fs = require('fs');
-const { spawn, spawnSync } = require('child_process');
+const prism = require('prism-media');
 
 const {
   Client,
@@ -36,49 +36,36 @@ const RADIO_URL =
   process.env.RADIO_URL ||
   'https://streams.antenne1.de/a1stg/mp3-128/streams.antenne1.de/';
 
-
-function ffmpegWorks(binary) {
-  if (!binary) return false;
-
-  try {
-    const result = spawnSync(binary, ['-version'], {
-      stdio: 'ignore',
-      timeout: 5000
-    });
-
-    return !result.error && result.status === 0;
-  } catch {
-    return false;
-  }
-}
-
 function resolveFfmpeg() {
-  // 1. Optionaler eigener Pfad aus der .env / dem Hosting-Panel
-  if (FFMPEG_OVERRIDE) {
-    if (ffmpegWorks(FFMPEG_OVERRIDE)) {
-      return { binary: FFMPEG_OVERRIDE, source: 'FFMPEG_BIN' };
-    }
+  if (FFMPEG_OVERRIDE && fs.existsSync(FFMPEG_OVERRIDE)) {
+    const originalGetInfo = prism.FFmpeg.getInfo.bind(prism.FFmpeg);
 
-    console.warn(`[FFMPEG] FFMPEG_BIN \"${FFMPEG_OVERRIDE}\" funktioniert nicht. Suche Alternative ...`);
+    prism.FFmpeg.getInfo = (force = false) => {
+      if (FFMPEG_OVERRIDE && fs.existsSync(FFMPEG_OVERRIDE)) {
+        return {
+          command: FFMPEG_OVERRIDE,
+          output: 'ffmpeg version custom',
+          version: 'custom'
+        };
+      }
+
+      return originalGetInfo(force);
+    };
+
+    return { source: 'FFMPEG_BIN', path: FFMPEG_OVERRIDE };
   }
 
-  // 2. Bevorzugt das FFmpeg des Hostsystems
-  if (ffmpegWorks('ffmpeg')) {
-    return { binary: 'ffmpeg', source: 'System-FFmpeg' };
-  }
-
-  // 3. Fallback fuer Bot-Hoster ohne vorinstalliertes FFmpeg
   try {
-    const staticFfmpeg = require('ffmpeg-static');
+    const info = prism.FFmpeg.getInfo();
+    const source = String(info.command).includes('node_modules')
+      ? 'ffmpeg-static'
+      : 'System-FFmpeg';
 
-    if (staticFfmpeg && fs.existsSync(staticFfmpeg)) {
-      return { binary: staticFfmpeg, source: 'ffmpeg-static Fallback' };
-    }
+    return { source, path: info.command };
   } catch (error) {
-    console.warn(`[FFMPEG] ffmpeg-static konnte nicht geladen werden: ${error.message}`);
+    console.warn(`[FFMPEG] FFmpeg nicht gefunden: ${error.message}`);
+    return null;
   }
-
-  return null;
 }
 
 if (!TOKEN) {
@@ -101,7 +88,7 @@ const player = createAudioPlayer({
 });
 
 let connection = null;
-let ffmpegProcess = null;
+let ffmpegStream = null;
 let restartTimer = null;
 let starting = false;
 let shuttingDown = false;
@@ -113,13 +100,13 @@ function log(message) {
 log(`Starte MB ANTENNE 1 Bot (Node.js ${process.version}) ...`);
 
 function stopFfmpeg() {
-  if (!ffmpegProcess) return;
+  if (!ffmpegStream) return;
 
   try {
-    ffmpegProcess.kill('SIGTERM');
+    ffmpegStream.destroy();
   } catch {}
 
-  ffmpegProcess = null;
+  ffmpegStream = null;
 }
 
 function scheduleRadioRestart(delay = 5000) {
@@ -150,59 +137,50 @@ function startRadio() {
   }
 
   log(`Starte ANTENNE 1 Stream über ${ffmpeg.source} ...`);
-  log(`FFmpeg-Befehl: ${ffmpeg.binary}`);
+  log(`FFmpeg-Befehl: ${ffmpeg.path}`);
 
-  const args = [
-    '-nostdin',
-    '-hide_banner',
-    '-loglevel', 'warning',
-
-    '-reconnect', '1',
-    '-reconnect_streamed', '1',
-    '-reconnect_at_eof', '1',
-    '-reconnect_delay_max', '5',
-
-    '-user_agent', 'Mozilla/5.0 MB-Antenne1-DiscordBot/1.2',
-
-    '-i', RADIO_URL,
-
-    '-vn',
-    '-map', '0:a:0',
-    '-ac', '2',
-    '-ar', '48000',
-    '-c:a', 'libopus',
-    '-b:a', '128k',
-    '-application', 'audio',
-    '-f', 'ogg',
-    'pipe:1'
-  ];
-
-  const proc = spawn(ffmpeg.binary, args, {
-    stdio: ['ignore', 'pipe', 'pipe']
+  const stream = new prism.FFmpeg({
+    args: [
+      '-nostdin',
+      '-hide_banner',
+      '-loglevel', 'warning',
+      '-reconnect', '1',
+      '-reconnect_streamed', '1',
+      '-reconnect_at_eof', '1',
+      '-reconnect_delay_max', '5',
+      '-user_agent', 'Mozilla/5.0 MB-Antenne1-DiscordBot/1.3',
+      '-i', RADIO_URL,
+      '-vn',
+      '-map', '0:a:0',
+      '-ac', '2',
+      '-ar', '48000',
+      '-c:a', 'libopus',
+      '-b:a', '128k',
+      '-application', 'audio',
+      '-f', 'ogg'
+    ]
   });
 
-  ffmpegProcess = proc;
+  ffmpegStream = stream;
 
-  proc.stderr.setEncoding('utf8');
-  proc.stderr.on('data', data => {
-    const msg = data.trim();
-    if (msg) console.log(`[FFMPEG] ${msg}`);
-  });
+  if (stream.process?.stderr) {
+    stream.process.stderr.setEncoding('utf8');
+    stream.process.stderr.on('data', data => {
+      const msg = data.trim();
+      if (msg) console.log(`[FFMPEG] ${msg}`);
+    });
+  }
 
-  proc.on('error', error => {
-    console.error('[FFMPEG] Konnte FFmpeg nicht starten:', error.message);
+  stream.on('error', error => {
+    console.error('[FFMPEG] Stream-Fehler:', error.message);
 
-    if (error.code === 'ENOENT') {
-      console.error('[FFMPEG] FFmpeg wurde nicht gefunden. Fuehre im Bot-Ordner npm install aus.');
-    }
-
-    if (ffmpegProcess === proc) ffmpegProcess = null;
+    if (ffmpegStream === stream) ffmpegStream = null;
     starting = false;
     scheduleRadioRestart(10000);
   });
 
-  proc.on('close', (code, signal) => {
-    if (ffmpegProcess === proc) ffmpegProcess = null;
+  stream.process?.on('close', (code, signal) => {
+    if (ffmpegStream === stream) ffmpegStream = null;
 
     log(`FFmpeg beendet (Code: ${code}, Signal: ${signal || 'keins'}).`);
     starting = false;
@@ -212,7 +190,7 @@ function startRadio() {
     }
   });
 
-  const resource = createAudioResource(proc.stdout, {
+  const resource = createAudioResource(stream, {
     inputType: StreamType.OggOpus
   });
 
@@ -340,7 +318,6 @@ async function onBotReady() {
   await connectVoice();
 }
 
-// discord.js v14.22+: clientReady; aeltere Versionen: ready
 const readyEvent = Events.ClientReady || 'ready';
 client.once(readyEvent, () => {
   onBotReady().catch(error => {
